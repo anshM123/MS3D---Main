@@ -1,0 +1,2835 @@
+"""Recovered from Untitled0__2_.ipynb — star3_construction.
+Cell sources concatenated in order. Console outputs are preserved
+as comments so the numerical record travels with the code.
+"""
+
+# ==========================================================================
+# CELL 0
+# ==========================================================================
+# ==================================================================================================
+# M3D TEST L
+#
+# CUBIC-DEFECT-CANCELING M3D-3*
+#
+# ONLY SCIENTIFIC CHANGE FROM K1:
+#
+#       M3D-2  --->  M3D-3*
+#
+# with
+#
+#       f  = F(U0)
+#       A  = DF(U0)
+#       Pi2 = P + q0 q0* + q1 q1*
+#       R2  = I - Pi2
+#
+#       r2 = R2 A f
+#
+#       q2* = r2 / ||r2||
+#
+# Then
+#
+#       Pi3 = Pi2 + q2 q2*
+#
+# so ideally
+#
+#       R3 A f = 0
+#
+# and therefore the resolved cubic error coefficient
+#
+#       C3 = P A R A f
+#
+# is canceled at every anchor.
+#
+#
+# FROZEN FROM K1:
+#
+#   N                    = 40
+#   projector            = mixed
+#   reanchor interval    = 0.15 tau
+#   final horizon        = 2.0 tau
+#   topology families    = same 4 K1 generators
+#   viscosities          = 0.25x, 1x, 4x
+#   truth correction     = NONE
+#   training/fitting     = NONE
+#
+#
+# IMPLEMENTATION GATE:
+#
+#   ||R3 A f|| / ||R2 A f|| < 1e-4
+#
+# and, when the rank-2 cubic coefficient is numerically resolvable,
+#
+#   ||P A R3 A f|| / ||P A R2 A f|| < 1e-2
+#
+#
+# PRIMARY SCIENTIFIC GATE:
+#
+#   all 12 cases:
+#
+#       final state error < 1%
+#       final RHS error   < 10%
+#
+#
+# IMPORTANT:
+# K1 is NOT rerun. Its saved results are the preregistered rank-2 baseline.
+# ==================================================================================================
+
+import gc
+import math
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+
+
+print("=" * 136)
+print("M3D TEST L — CUBIC-DEFECT-CANCELING M3D-3*")
+print("=" * 136)
+
+
+# ==================================================================================================
+# 0. PREFLIGHT
+# ==================================================================================================
+
+REQUIRED_L = [
+    # rebuilt baseline
+    "small_env_D",
+    "initialize_model_D",
+    "_pair_rhs_D",
+    "pair_inner_D",
+    "pair_norm_D",
+    "zero_target_modes_D",
+    "pack_modes_D",
+    "unpack_modes_D",
+    "project_divfree_D",
+    "dealias_D",
+    "velocity_rhs_D",
+    "full_rk4_D",
+    "NU1_D",
+    "NU2_D",
+    "TAU0_D",
+    "DEVICE_D",
+    "REAL_DTYPE_D",
+
+    # K1 deterministic test definitions
+    "topology_pair_K",
+    "TOPOLOGIES_K",
+    "NU_MULTS_K",
+    "BASE_NU_K",
+    "COMMON_TAU0_K",
+    "DT_PHYS_K",
+    "PROJECTOR_K",
+]
+
+missing_L = [
+    name
+    for name in REQUIRED_L
+    if name not in globals()
+]
+
+if missing_L:
+    raise RuntimeError(
+        "Missing required K1/baseline definitions:\n"
+        + repr(missing_L)
+        + "\n\nRun m3d_baseline_rebuilt.py and the K1 cell definitions first."
+    )
+
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA GPU required.")
+
+ENV_L = small_env_D
+
+FINAL_TAU_L = 2.0
+ANCHOR_INTERVAL_L = 0.15
+
+DT_PHYS_L = float(DT_PHYS_K)
+COMMON_TAU0_L = float(COMMON_TAU0_K)
+
+DTAU_L = (
+    DT_PHYS_L
+    /
+    COMMON_TAU0_L
+)
+
+MAX_STEPS_L = int(
+    math.ceil(
+        FINAL_TAU_L
+        /
+        DTAU_L
+    )
+)
+
+REPORT_TAUS_L = [
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+]
+
+R3_RATIO_GATE_L = 1e-4
+CUBIC_RATIO_GATE_L = 1e-2
+
+print()
+print("GPU:", torch.cuda.get_device_name(0))
+print("N:", ENV_L["N"])
+print("L:", ENV_L["L"])
+print("dx:", ENV_L["dx"])
+
+print()
+print("d_tau:", DTAU_L)
+print("final tau:", FINAL_TAU_L)
+print("reanchor interval:", ANCHOR_INTERVAL_L)
+print("steps/case:", MAX_STEPS_L)
+
+
+# ==================================================================================================
+# 1. LOAD THE FROZEN K1 RANK-2 BASELINE
+# ==================================================================================================
+
+K1_PATH_L = Path(
+    "/content/m3d2_K1_12case_final.csv"
+)
+
+if (
+    "RESULTS_K"
+    in globals()
+    and
+    isinstance(
+        RESULTS_K,
+        pd.DataFrame,
+    )
+    and
+    len(RESULTS_K)
+    ==
+    12
+):
+
+    K1_BASELINE_L = (
+        RESULTS_K.copy()
+    )
+
+    print()
+    print(
+        "Using in-memory K1 RESULTS_K as frozen rank-2 baseline."
+    )
+
+elif K1_PATH_L.exists():
+
+    K1_BASELINE_L = pd.read_csv(
+        K1_PATH_L
+    )
+
+    print()
+    print(
+        "Loaded frozen rank-2 K1 baseline from:",
+        str(K1_PATH_L),
+    )
+
+else:
+
+    raise RuntimeError(
+        "Cannot find frozen K1 results. "
+        "Need RESULTS_K in memory or "
+        "/content/m3d2_K1_12case_final.csv"
+    )
+
+
+# ==================================================================================================
+# 2. CENTERED JVP
+#
+# Since the spectral NS RHS is quadratic, the centered JVP is algebraically
+# exact apart from floating-point roundoff:
+#
+#     DF(U)V =
+#       ||V|| [F(U+eps Vhat)-F(U-eps Vhat)] / (2 eps)
+#
+# ==================================================================================================
+
+@torch.no_grad()
+def pair_jvp_L(
+    U1,
+    U2,
+    V1,
+    V2,
+    env,
+):
+
+    vn = pair_norm_D(
+        V1,
+        V2,
+    )
+
+    vn_float = float(
+        vn.detach().cpu()
+    )
+
+    if (
+        not np.isfinite(
+            vn_float
+        )
+        or
+        vn_float
+        <
+        1e-13
+    ):
+
+        return (
+            torch.zeros_like(U1),
+            torch.zeros_like(U2),
+        )
+
+    v1 = V1 / vn
+    v2 = V2 / vn
+
+    un = pair_norm_D(
+        U1,
+        U2,
+    )
+
+    eps = max(
+        1e-5,
+        1e-3
+        *
+        float(
+            un.detach().cpu()
+        ),
+    )
+
+    Fp1, Fp2 = _pair_rhs_D(
+        U1 + eps * v1,
+        U2 + eps * v2,
+        env,
+    )
+
+    Fm1, Fm2 = _pair_rhs_D(
+        U1 - eps * v1,
+        U2 - eps * v2,
+        env,
+    )
+
+    Jv1 = (
+        Fp1 - Fm1
+    ) / (
+        2.0 * eps
+    )
+
+    Jv2 = (
+        Fp2 - Fm2
+    ) / (
+        2.0 * eps
+    )
+
+    return (
+        vn * Jv1,
+        vn * Jv2,
+    )
+
+
+# ==================================================================================================
+# 3. APPLY R2 = I - P - q0q0* - q1q1*
+# ==================================================================================================
+
+@torch.no_grad()
+def rank2_residual_L(
+    A1,
+    A2,
+    model2,
+):
+
+    tids = model2[
+        "proj"
+    ][
+        "target_ids"
+    ]
+
+    # Remove resolved target P.
+    R1, R2 = zero_target_modes_D(
+        A1,
+        A2,
+        tids,
+    )
+
+    # Remove q0.
+    a0 = pair_inner_D(
+        model2["q0_U1"],
+        model2["q0_U2"],
+        R1,
+        R2,
+    )
+
+    R1 = (
+        R1
+        -
+        a0
+        *
+        model2["q0_U1"]
+    )
+
+    R2 = (
+        R2
+        -
+        a0
+        *
+        model2["q0_U2"]
+    )
+
+    # Remove q1.
+    a1 = pair_inner_D(
+        model2["q1_U1"],
+        model2["q1_U2"],
+        R1,
+        R2,
+    )
+
+    R1 = (
+        R1
+        -
+        a1
+        *
+        model2["q1_U1"]
+    )
+
+    R2 = (
+        R2
+        -
+        a1
+        *
+        model2["q1_U2"]
+    )
+
+    # Remove numerical target leakage one more time.
+    R1, R2 = zero_target_modes_D(
+        R1,
+        R2,
+        tids,
+    )
+
+    return R1, R2
+
+
+# ==================================================================================================
+# 4. BUILD M3D-3*
+# ==================================================================================================
+
+@torch.no_grad()
+def initialize_model3_L(
+    U10,
+    U20,
+    projector_name,
+    env,
+):
+
+    # ------------------------------------------------------------------
+    # Start with IDENTICAL q0/q1 M3D-2 construction.
+    # ------------------------------------------------------------------
+
+    model = initialize_model_D(
+        U10,
+        U20,
+        projector_name,
+        env,
+    )
+
+    tids = model[
+        "proj"
+    ][
+        "target_ids"
+    ]
+
+    dids = model[
+        "proj"
+    ][
+        "dep_ids"
+    ]
+
+    # ------------------------------------------------------------------
+    # f = F(U0)
+    # ------------------------------------------------------------------
+
+    f1, f2 = _pair_rhs_D(
+        U10,
+        U20,
+        env,
+    )
+
+    # ------------------------------------------------------------------
+    # A f = DF(U0) F(U0)
+    # ------------------------------------------------------------------
+
+    Af1, Af2 = pair_jvp_L(
+        U10,
+        U20,
+        f1,
+        f2,
+        env,
+    )
+
+    # ------------------------------------------------------------------
+    # r2 = R2 A f
+    # ------------------------------------------------------------------
+
+    r21, r22 = rank2_residual_L(
+        Af1,
+        Af2,
+        model,
+    )
+
+    r2_norm = pair_norm_D(
+        r21,
+        r22,
+    )
+
+    Af_norm = pair_norm_D(
+        Af1,
+        Af2,
+    )
+
+    r2_float = float(
+        r2_norm.detach().cpu()
+    )
+
+    Af_float = float(
+        Af_norm.detach().cpu()
+    )
+
+    # ------------------------------------------------------------------
+    # q2* = r2 / ||r2||
+    # ------------------------------------------------------------------
+
+    q2_active = bool(
+        np.isfinite(
+            r2_float
+        )
+        and
+        r2_float
+        >
+        max(
+            1e-11,
+            1e-8
+            *
+            max(
+                Af_float,
+                1e-30,
+            ),
+        )
+    )
+
+    if q2_active:
+
+        q21 = (
+            r21
+            /
+            r2_norm
+        )
+
+        q22 = (
+            r22
+            /
+            r2_norm
+        )
+
+        # --------------------------------------------------------------
+        # One explicit cleanup orthogonalization against q0, q1 and P.
+        # --------------------------------------------------------------
+
+        q21, q22 = zero_target_modes_D(
+            q21,
+            q22,
+            tids,
+        )
+
+        b0 = pair_inner_D(
+            model["q0_U1"],
+            model["q0_U2"],
+            q21,
+            q22,
+        )
+
+        q21 = (
+            q21
+            -
+            b0
+            *
+            model["q0_U1"]
+        )
+
+        q22 = (
+            q22
+            -
+            b0
+            *
+            model["q0_U2"]
+        )
+
+        b1 = pair_inner_D(
+            model["q1_U1"],
+            model["q1_U2"],
+            q21,
+            q22,
+        )
+
+        q21 = (
+            q21
+            -
+            b1
+            *
+            model["q1_U1"]
+        )
+
+        q22 = (
+            q22
+            -
+            b1
+            *
+            model["q1_U2"]
+        )
+
+        q21, q22 = zero_target_modes_D(
+            q21,
+            q22,
+            tids,
+        )
+
+        nq2 = pair_norm_D(
+            q21,
+            q22,
+        )
+
+        q21 = q21 / nq2
+        q22 = q22 / nq2
+
+    else:
+
+        q21 = torch.zeros_like(
+            model["q0_U1"]
+        )
+
+        q22 = torch.zeros_like(
+            model["q0_U2"]
+        )
+
+    # ------------------------------------------------------------------
+    # Verify R3 A f.
+    #
+    # r3 = r2 - q2 q2* r2
+    # ------------------------------------------------------------------
+
+    if q2_active:
+
+        gamma = pair_inner_D(
+            q21,
+            q22,
+            r21,
+            r22,
+        )
+
+        r31 = (
+            r21
+            -
+            gamma
+            *
+            q21
+        )
+
+        r32 = (
+            r22
+            -
+            gamma
+            *
+            q22
+        )
+
+    else:
+
+        r31 = r21.clone()
+        r32 = r22.clone()
+
+    r3_norm = pair_norm_D(
+        r31,
+        r32,
+    )
+
+    r3_ratio = float(
+        (
+            r3_norm
+            /
+            (
+                r2_norm
+                +
+                1e-30
+            )
+        ).detach().cpu()
+    )
+
+    # ------------------------------------------------------------------
+    # Verify the actual target cubic coefficient:
+    #
+    #     C3^(2) = P A r2
+    #     C3^(3) = P A r3
+    #
+    # ------------------------------------------------------------------
+
+    Ar21, Ar22 = pair_jvp_L(
+        U10,
+        U20,
+        r21,
+        r22,
+        env,
+    )
+
+    Ar31, Ar32 = pair_jvp_L(
+        U10,
+        U20,
+        r31,
+        r32,
+        env,
+    )
+
+    C32 = pack_modes_D(
+        Ar21,
+        Ar22,
+        tids,
+    )
+
+    C33 = pack_modes_D(
+        Ar31,
+        Ar32,
+        tids,
+    )
+
+    C32_norm = float(
+        torch.linalg.vector_norm(
+            C32
+        ).detach().cpu()
+    )
+
+    C33_norm = float(
+        torch.linalg.vector_norm(
+            C33
+        ).detach().cpu()
+    )
+
+    if (
+        C32_norm
+        >
+        1e-12
+    ):
+
+        cubic_ratio = (
+            C33_norm
+            /
+            C32_norm
+        )
+
+    else:
+
+        cubic_ratio = np.nan
+
+    # ------------------------------------------------------------------
+    # Full q0/q1/q2 Gram diagnostic.
+    # ------------------------------------------------------------------
+
+    qs = [
+        (
+            model["q0_U1"],
+            model["q0_U2"],
+        ),
+        (
+            model["q1_U1"],
+            model["q1_U2"],
+        ),
+    ]
+
+    if q2_active:
+        qs.append(
+            (
+                q21,
+                q22,
+            )
+        )
+
+    gram_full = torch.zeros(
+        (
+            len(qs),
+            len(qs),
+        ),
+        device=DEVICE_D,
+        dtype=REAL_DTYPE_D,
+    )
+
+    for i in range(
+        len(qs)
+    ):
+
+        for j in range(
+            len(qs)
+        ):
+
+            gram_full[
+                i,
+                j
+            ] = pair_inner_D(
+                qs[i][0],
+                qs[i][1],
+                qs[j][0],
+                qs[j][1],
+            )
+
+    gram_error3 = float(
+        torch.max(
+            torch.abs(
+                gram_full
+                -
+                torch.eye(
+                    len(qs),
+                    device=DEVICE_D,
+                    dtype=REAL_DTYPE_D,
+                )
+            )
+        ).detach().cpu()
+    )
+
+    # ------------------------------------------------------------------
+    # Extend the stored model.
+    # ------------------------------------------------------------------
+
+    model[
+        "name"
+    ] = (
+        f"M3D-3star-{projector_name}"
+    )
+
+    model[
+        "q2_U1"
+    ] = q21
+
+    model[
+        "q2_U2"
+    ] = q22
+
+    model[
+        "q2_active"
+    ] = q2_active
+
+    model[
+        "effective_hidden_rank"
+    ] = (
+        3
+        if q2_active
+        else
+        2
+    )
+
+    # reset hidden coordinates to the NEW local anchor
+    model[
+        "z"
+    ] = torch.zeros(
+        3,
+        device=DEVICE_D,
+        dtype=REAL_DTYPE_D,
+    )
+
+    q0_dep = pack_modes_D(
+        model["q0_U1"],
+        model["q0_U2"],
+        dids,
+    )
+
+    q1_dep = pack_modes_D(
+        model["q1_U1"],
+        model["q1_U2"],
+        dids,
+    )
+
+    q2_dep = pack_modes_D(
+        q21,
+        q22,
+        dids,
+    )
+
+    model[
+        "Qr3"
+    ] = torch.stack(
+        (
+            q0_dep,
+            q1_dep,
+            q2_dep,
+        ),
+        dim=1,
+    )
+
+    model[
+        "r2_norm"
+    ] = r2_float
+
+    model[
+        "r3_ratio"
+    ] = r3_ratio
+
+    model[
+        "c3_rank2_norm"
+    ] = C32_norm
+
+    model[
+        "c3_rank3_norm"
+    ] = C33_norm
+
+    model[
+        "cubic_ratio"
+    ] = cubic_ratio
+
+    model[
+        "gram_error3"
+    ] = gram_error3
+
+    model[
+        "cubic_cancel_ok"
+    ] = bool(
+        (
+            not q2_active
+        )
+        or
+        (
+            r3_ratio
+            <
+            R3_RATIO_GATE_L
+            and
+            (
+                not np.isfinite(
+                    cubic_ratio
+                )
+                or
+                cubic_ratio
+                <
+                CUBIC_RATIO_GATE_L
+            )
+        )
+    )
+
+    return model
+
+
+# ==================================================================================================
+# 5. M3D-3* STATE RECONSTRUCTION
+# ==================================================================================================
+
+@torch.no_grad()
+def reconstruct_m3d3_L(
+    x,
+    z,
+    U10,
+    U20,
+    model,
+    env,
+):
+
+    tids = model[
+        "proj"
+    ][
+        "target_ids"
+    ]
+
+    x_phys = (
+        x
+        *
+        model["x_scale"]
+    )
+
+    U1, U2 = unpack_modes_D(
+        x_phys,
+        U10,
+        U20,
+        tids,
+    )
+
+    hs = model[
+        "hidden_scale"
+    ]
+
+    U1 = (
+        U1
+        +
+        hs
+        *
+        (
+            z[0]
+            *
+            model["q0_U1"]
+            +
+            z[1]
+            *
+            model["q1_U1"]
+            +
+            z[2]
+            *
+            model["q2_U1"]
+        )
+    )
+
+    U2 = (
+        U2
+        +
+        hs
+        *
+        (
+            z[0]
+            *
+            model["q0_U2"]
+            +
+            z[1]
+            *
+            model["q1_U2"]
+            +
+            z[2]
+            *
+            model["q2_U2"]
+        )
+    )
+
+    U1 = dealias_D(
+        project_divfree_D(
+            U1,
+            env,
+        ),
+        env,
+    )
+
+    U2 = dealias_D(
+        project_divfree_D(
+            U2,
+            env,
+        ),
+        env,
+    )
+
+    return U1, U2
+
+
+# ==================================================================================================
+# 6. M3D-3* RHS
+# ==================================================================================================
+
+@torch.no_grad()
+def m3d3_rhs_L(
+    x,
+    z,
+    U10,
+    U20,
+    model,
+    env,
+):
+
+    U1, U2 = reconstruct_m3d3_L(
+        x,
+        z,
+        U10,
+        U20,
+        model,
+        env,
+    )
+
+    F1, F2 = _pair_rhs_D(
+        U1,
+        U2,
+        env,
+    )
+
+    tids = model[
+        "proj"
+    ][
+        "target_ids"
+    ]
+
+    dx_phys_dt = pack_modes_D(
+        F1,
+        F2,
+        tids,
+    )
+
+    dx_dtau = (
+        TAU0_D
+        *
+        dx_phys_dt
+        /
+        model["x_scale"]
+    )
+
+    hs = model[
+        "hidden_scale"
+    ]
+
+    dz0 = (
+        pair_inner_D(
+            model["q0_U1"],
+            model["q0_U2"],
+            F1,
+            F2,
+        )
+        /
+        hs
+    )
+
+    dz1 = (
+        pair_inner_D(
+            model["q1_U1"],
+            model["q1_U2"],
+            F1,
+            F2,
+        )
+        /
+        hs
+    )
+
+    dz2 = (
+        pair_inner_D(
+            model["q2_U1"],
+            model["q2_U2"],
+            F1,
+            F2,
+        )
+        /
+        hs
+    )
+
+    dz_dtau = (
+        TAU0_D
+        *
+        torch.stack(
+            (
+                dz0,
+                dz1,
+                dz2,
+            )
+        )
+    ).to(
+        REAL_DTYPE_D
+    )
+
+    return (
+        dx_dtau.to(
+            REAL_DTYPE_D
+        ),
+        dz_dtau,
+    )
+
+
+# ==================================================================================================
+# 7. RK4
+# ==================================================================================================
+
+@torch.no_grad()
+def m3d3_rk4_L(
+    model,
+    d_tau,
+    env,
+):
+
+    x0 = model["x"]
+    z0 = model["z"]
+
+    U10 = model[
+        "anchor_U1"
+    ]
+
+    U20 = model[
+        "anchor_U2"
+    ]
+
+    k1x, k1z = m3d3_rhs_L(
+        x0,
+        z0,
+        U10,
+        U20,
+        model,
+        env,
+    )
+
+    k2x, k2z = m3d3_rhs_L(
+        x0
+        +
+        0.5
+        *
+        d_tau
+        *
+        k1x,
+
+        z0
+        +
+        0.5
+        *
+        d_tau
+        *
+        k1z,
+
+        U10,
+        U20,
+        model,
+        env,
+    )
+
+    k3x, k3z = m3d3_rhs_L(
+        x0
+        +
+        0.5
+        *
+        d_tau
+        *
+        k2x,
+
+        z0
+        +
+        0.5
+        *
+        d_tau
+        *
+        k2z,
+
+        U10,
+        U20,
+        model,
+        env,
+    )
+
+    k4x, k4z = m3d3_rhs_L(
+        x0
+        +
+        d_tau
+        *
+        k3x,
+
+        z0
+        +
+        d_tau
+        *
+        k3z,
+
+        U10,
+        U20,
+        model,
+        env,
+    )
+
+    model["x"] = (
+        x0
+        +
+        (
+            d_tau
+            /
+            6.0
+        )
+        *
+        (
+            k1x
+            +
+            2.0 * k2x
+            +
+            2.0 * k3x
+            +
+            k4x
+        )
+    )
+
+    model["z"] = (
+        z0
+        +
+        (
+            d_tau
+            /
+            6.0
+        )
+        *
+        (
+            k1z
+            +
+            2.0 * k2z
+            +
+            2.0 * k3z
+            +
+            k4z
+        )
+    )
+
+    return (
+        model["x"],
+        model["z"],
+    )
+
+
+# ==================================================================================================
+# 8. TEACHER-FREE REANCHOR
+# ==================================================================================================
+
+@torch.no_grad()
+def current_full_state3_L(
+    model,
+    env,
+):
+
+    return reconstruct_m3d3_L(
+        model["x"],
+        model["z"],
+        model["anchor_U1"],
+        model["anchor_U2"],
+        model,
+        env,
+    )
+
+
+@torch.no_grad()
+def reanchor_model3_L(
+    model,
+    env,
+):
+
+    U1, U2 = current_full_state3_L(
+        model,
+        env,
+    )
+
+    return initialize_model3_L(
+        U1,
+        U2,
+        model["proj"]["name"],
+        env,
+    )
+
+
+# ==================================================================================================
+# 9. SCORING
+# ==================================================================================================
+
+def relative_error_L(
+    a,
+    b,
+):
+
+    return float(
+        (
+            torch.linalg.vector_norm(
+                a - b
+            )
+            /
+            (
+                torch.linalg.vector_norm(
+                    b
+                )
+                +
+                1e-30
+            )
+        ).detach().cpu()
+    )
+
+
+def finite_model3_L(
+    model,
+):
+
+    return bool(
+        torch.isfinite(
+            model["x"]
+        ).all().item()
+        and
+        torch.isfinite(
+            model["z"]
+        ).all().item()
+    )
+
+
+@torch.no_grad()
+def model_target3_L(
+    model,
+):
+
+    return (
+        model["x"]
+        *
+        model["x_scale"]
+    )
+
+
+@torch.no_grad()
+def truth_target_L(
+    U1,
+    U2,
+    model,
+):
+
+    return pack_modes_D(
+        U1,
+        U2,
+        model[
+            "proj"
+        ][
+            "target_ids"
+        ],
+    )
+
+
+@torch.no_grad()
+def truth_target_rhs_L(
+    U1,
+    U2,
+    model,
+    nu,
+    env,
+):
+
+    F1 = velocity_rhs_D(
+        U1,
+        nu,
+        env,
+    )
+
+    F2 = velocity_rhs_D(
+        U2,
+        nu,
+        env,
+    )
+
+    return pack_modes_D(
+        F1,
+        F2,
+        model[
+            "proj"
+        ][
+            "target_ids"
+        ],
+    )
+
+
+@torch.no_grad()
+def model_target_rhs3_L(
+    model,
+    env,
+):
+
+    dx_tau, _ = m3d3_rhs_L(
+        model["x"],
+        model["z"],
+        model["anchor_U1"],
+        model["anchor_U2"],
+        model,
+        env,
+    )
+
+    return (
+        dx_tau
+        *
+        model["x_scale"]
+        /
+        float(
+            TAU0_D
+        )
+    )
+
+
+@torch.no_grad()
+def score3_L(
+    model,
+    U1_truth,
+    U2_truth,
+    nu,
+    env,
+):
+
+    tx = truth_target_L(
+        U1_truth,
+        U2_truth,
+        model,
+    )
+
+    px = model_target3_L(
+        model
+    )
+
+    trhs = truth_target_rhs_L(
+        U1_truth,
+        U2_truth,
+        model,
+        nu,
+        env,
+    )
+
+    prhs = model_target_rhs3_L(
+        model,
+        env,
+    )
+
+    return (
+        relative_error_L(
+            px,
+            tx,
+        ),
+        relative_error_L(
+            prhs,
+            trhs,
+        ),
+    )
+
+
+# ==================================================================================================
+# 10. CUBIC-CANCELLATION PREFLIGHT — ALL 12 CASES
+#
+# Stop BEFORE trajectory integration if q2 does not actually perform
+# the algebraic cancellation it is supposed to.
+# ==================================================================================================
+
+print()
+print("=" * 136)
+print("CUBIC-CANCELLATION PREFLIGHT")
+print("=" * 136)
+
+original_nu1_L = float(
+    NU1_D
+)
+
+original_nu2_L = float(
+    NU2_D
+)
+
+original_tau0_L = float(
+    TAU0_D
+)
+
+preflight_rows_L = []
+
+try:
+
+    for topology_L in TOPOLOGIES_K:
+
+        for nu_mult_L in NU_MULTS_K:
+
+            nu_L = (
+                float(
+                    BASE_NU_K
+                )
+                *
+                float(
+                    nu_mult_L
+                )
+            )
+
+            NU1_D = nu_L
+            NU2_D = nu_L
+            TAU0_D = COMMON_TAU0_L
+
+            U10_L, U20_L = topology_pair_K(
+                topology_L,
+                ENV_L,
+            )
+
+            model_L = initialize_model3_L(
+                U10_L,
+                U20_L,
+                PROJECTOR_K,
+                ENV_L,
+            )
+
+            print(
+                f"{topology_L:16s}"
+                f" | nu x {nu_mult_L:4.2f}"
+                f" | rank={model_L['effective_hidden_rank']}"
+                f" | R3/R2={model_L['r3_ratio']:.3e}"
+                f" | C3_3/C3_2={model_L['cubic_ratio']:.3e}"
+                f" | Gram={model_L['gram_error3']:.3e}"
+                f" | OK={model_L['cubic_cancel_ok']}"
+            )
+
+            preflight_rows_L.append(
+                {
+                    "topology":
+                        topology_L,
+
+                    "nu_mult":
+                        nu_mult_L,
+
+                    "q2_active":
+                        model_L[
+                            "q2_active"
+                        ],
+
+                    "effective_hidden_rank":
+                        model_L[
+                            "effective_hidden_rank"
+                        ],
+
+                    "r2_norm":
+                        model_L[
+                            "r2_norm"
+                        ],
+
+                    "r3_ratio":
+                        model_L[
+                            "r3_ratio"
+                        ],
+
+                    "c3_rank2_norm":
+                        model_L[
+                            "c3_rank2_norm"
+                        ],
+
+                    "c3_rank3_norm":
+                        model_L[
+                            "c3_rank3_norm"
+                        ],
+
+                    "cubic_ratio":
+                        model_L[
+                            "cubic_ratio"
+                        ],
+
+                    "gram_error3":
+                        model_L[
+                            "gram_error3"
+                        ],
+
+                    "cubic_cancel_ok":
+                        model_L[
+                            "cubic_cancel_ok"
+                        ],
+                }
+            )
+
+            if not model_L[
+                "cubic_cancel_ok"
+            ]:
+
+                raise RuntimeError(
+                    "\nCUBIC-CANCELLATION PREFLIGHT FAILED.\n"
+                    f"topology={topology_L}, nu_mult={nu_mult_L}\n"
+                    f"R3/R2={model_L['r3_ratio']}\n"
+                    f"C3 ratio={model_L['cubic_ratio']}\n"
+                    "Do not run trajectories until this is fixed."
+                )
+
+            del U10_L
+            del U20_L
+            del model_L
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+finally:
+
+    NU1_D = original_nu1_L
+    NU2_D = original_nu2_L
+    TAU0_D = original_tau0_L
+
+
+PREFLIGHT_L = pd.DataFrame(
+    preflight_rows_L
+)
+
+print()
+print(
+    "✅ ALL 12 INITIAL CUBIC-CANCELLATION CHECKS PASSED."
+)
+
+
+# ==================================================================================================
+# 11. SINGLE M3D-3* CASE
+# ==================================================================================================
+
+@torch.no_grad()
+def run_case3_L(
+    topology,
+    nu_mult,
+    case_number,
+):
+
+    global NU1_D
+    global NU2_D
+    global TAU0_D
+
+    nu = (
+        float(
+            BASE_NU_K
+        )
+        *
+        float(
+            nu_mult
+        )
+    )
+
+    NU1_D = nu
+    NU2_D = nu
+    TAU0_D = COMMON_TAU0_L
+
+    U10, U20 = topology_pair_K(
+        topology,
+        ENV_L,
+    )
+
+    # CFD truth is scoring-only.
+    U1_truth = U10.clone()
+    U2_truth = U20.clone()
+
+    torch.cuda.synchronize()
+
+    build_start = time.perf_counter()
+
+    model = initialize_model3_L(
+        U10,
+        U20,
+        PROJECTOR_K,
+        ENV_L,
+    )
+
+    torch.cuda.synchronize()
+
+    initial_build_s = (
+        time.perf_counter()
+        -
+        build_start
+    )
+
+    if not model[
+        "cubic_cancel_ok"
+    ]:
+
+        raise RuntimeError(
+            "Initial cubic cancellation unexpectedly failed."
+        )
+
+    next_anchor_tau = (
+        ANCHOR_INTERVAL_L
+    )
+
+    next_report_i = 0
+
+    reanchors = 0
+    rebuild_total_s = 0.0
+
+    worst_jump = 0.0
+    worst_r3_ratio = float(
+        model[
+            "r3_ratio"
+        ]
+    )
+
+    finite_cubic_ratios = []
+
+    if np.isfinite(
+        model[
+            "cubic_ratio"
+        ]
+    ):
+        finite_cubic_ratios.append(
+            float(
+                model[
+                    "cubic_ratio"
+                ]
+            )
+        )
+
+    event_rows = []
+    checkpoint_rows = []
+
+    torch.cuda.synchronize()
+
+    trajectory_start = time.perf_counter()
+
+    final_tau = 0.0
+
+    for step in range(
+        1,
+        MAX_STEPS_L + 1,
+    ):
+
+        # ------------------------------------------------------------------
+        # Full NS truth — never used by reanchoring.
+        # ------------------------------------------------------------------
+
+        U1_truth = full_rk4_D(
+            U1_truth,
+            DT_PHYS_L,
+            nu,
+            ENV_L,
+        )
+
+        U2_truth = full_rk4_D(
+            U2_truth,
+            DT_PHYS_L,
+            nu,
+            ENV_L,
+        )
+
+        # ------------------------------------------------------------------
+        # M3D-3*
+        # ------------------------------------------------------------------
+
+        m3d3_rk4_L(
+            model,
+            DTAU_L,
+            ENV_L,
+        )
+
+        current_tau = (
+            step
+            *
+            DTAU_L
+        )
+
+        final_tau = current_tau
+
+        if not finite_model3_L(
+            model
+        ):
+
+            print(
+                "MODEL BECAME NON-FINITE."
+            )
+
+            break
+
+        # ------------------------------------------------------------------
+        # Teacher-free periodic reanchor.
+        # ------------------------------------------------------------------
+
+        if (
+            current_tau
+            >=
+            next_anchor_tau
+            -
+            0.5
+            *
+            DTAU_L
+            and
+            next_anchor_tau
+            <
+            FINAL_TAU_L
+            -
+            1e-12
+        ):
+
+            target_before = (
+                model_target3_L(
+                    model
+                ).clone()
+            )
+
+            torch.cuda.synchronize()
+
+            rb_start = time.perf_counter()
+
+            # ==============================================================
+            # NO TRUTH STATE HERE.
+            # ==============================================================
+
+            model = reanchor_model3_L(
+                model,
+                ENV_L,
+            )
+
+            # ==============================================================
+
+            torch.cuda.synchronize()
+
+            rb_s = (
+                time.perf_counter()
+                -
+                rb_start
+            )
+
+            target_after = model_target3_L(
+                model
+            )
+
+            jump = relative_error_L(
+                target_after,
+                target_before,
+            )
+
+            if not model[
+                "cubic_cancel_ok"
+            ]:
+
+                raise RuntimeError(
+                    "\nCUBIC CANCELLATION FAILED DURING REANCHOR.\n"
+                    f"case={case_number}\n"
+                    f"topology={topology}\n"
+                    f"nu_mult={nu_mult}\n"
+                    f"tau={current_tau}\n"
+                    f"R3/R2={model['r3_ratio']}\n"
+                    f"C3 ratio={model['cubic_ratio']}"
+                )
+
+            reanchors += 1
+
+            rebuild_total_s += (
+                rb_s
+            )
+
+            worst_jump = max(
+                worst_jump,
+                jump,
+            )
+
+            worst_r3_ratio = max(
+                worst_r3_ratio,
+                float(
+                    model[
+                        "r3_ratio"
+                    ]
+                ),
+            )
+
+            if np.isfinite(
+                model[
+                    "cubic_ratio"
+                ]
+            ):
+
+                finite_cubic_ratios.append(
+                    float(
+                        model[
+                            "cubic_ratio"
+                        ]
+                    )
+                )
+
+            event_rows.append(
+                {
+                    "case":
+                        case_number,
+
+                    "topology":
+                        topology,
+
+                    "nu_mult":
+                        nu_mult,
+
+                    "reanchor":
+                        reanchors,
+
+                    "tau":
+                        current_tau,
+
+                    "scheduled_tau":
+                        next_anchor_tau,
+
+                    "build_seconds":
+                        rb_s,
+
+                    "target_jump":
+                        jump,
+
+                    "r2_norm":
+                        model[
+                            "r2_norm"
+                        ],
+
+                    "r3_ratio":
+                        model[
+                            "r3_ratio"
+                        ],
+
+                    "c3_rank2_norm":
+                        model[
+                            "c3_rank2_norm"
+                        ],
+
+                    "c3_rank3_norm":
+                        model[
+                            "c3_rank3_norm"
+                        ],
+
+                    "cubic_ratio":
+                        model[
+                            "cubic_ratio"
+                        ],
+
+                    "gram_error3":
+                        model[
+                            "gram_error3"
+                        ],
+                }
+            )
+
+            next_anchor_tau += (
+                ANCHOR_INTERVAL_L
+            )
+
+        # ------------------------------------------------------------------
+        # Reports.
+        # ------------------------------------------------------------------
+
+        while (
+            next_report_i
+            <
+            len(
+                REPORT_TAUS_L
+            )
+            and
+            current_tau
+            >=
+            REPORT_TAUS_L[
+                next_report_i
+            ]
+            -
+            0.5
+            *
+            DTAU_L
+        ):
+
+            state_err, rhs_err = score3_L(
+                model,
+                U1_truth,
+                U2_truth,
+                nu,
+                ENV_L,
+            )
+
+            checkpoint_rows.append(
+                {
+                    "case":
+                        case_number,
+
+                    "topology":
+                        topology,
+
+                    "nu_mult":
+                        nu_mult,
+
+                    "tau":
+                        current_tau,
+
+                    "state_error":
+                        state_err,
+
+                    "rhs_error":
+                        rhs_err,
+
+                    "reanchors":
+                        reanchors,
+                }
+            )
+
+            print(
+                f"    tau={current_tau:6.3f}"
+                f" | M3D-3* state={100*state_err:9.4f}%"
+                f" | RHS={100*rhs_err:9.4f}%"
+                f" | anchors={reanchors:2d}"
+            )
+
+            next_report_i += 1
+
+    torch.cuda.synchronize()
+
+    trajectory_s = (
+        time.perf_counter()
+        -
+        trajectory_start
+    )
+
+    state_final, rhs_final = score3_L(
+        model,
+        U1_truth,
+        U2_truth,
+        nu,
+        ENV_L,
+    )
+
+    strict_pass = bool(
+        finite_model3_L(
+            model
+        )
+        and
+        final_tau
+        >=
+        FINAL_TAU_L
+        -
+        DTAU_L
+        and
+        state_final
+        <
+        0.01
+        and
+        rhs_final
+        <
+        0.10
+    )
+
+    return (
+        {
+            "case":
+                case_number,
+
+            "topology":
+                topology,
+
+            "nu_mult":
+                float(
+                    nu_mult
+                ),
+
+            "final_tau":
+                final_tau,
+
+            "state_error_m3d3":
+                state_final,
+
+            "rhs_error_m3d3":
+                rhs_final,
+
+            "initial_build_s":
+                initial_build_s,
+
+            "reanchors":
+                reanchors,
+
+            "rebuild_total_s":
+                rebuild_total_s,
+
+            "mean_rebuild_s":
+                (
+                    rebuild_total_s
+                    /
+                    max(
+                        reanchors,
+                        1,
+                    )
+                ),
+
+            "worst_target_jump":
+                worst_jump,
+
+            "worst_r3_ratio":
+                worst_r3_ratio,
+
+            "worst_cubic_ratio":
+                (
+                    max(
+                        finite_cubic_ratios
+                    )
+                    if
+                    len(
+                        finite_cubic_ratios
+                    )
+                    else
+                    np.nan
+                ),
+
+            "trajectory_runtime_s":
+                trajectory_s,
+
+            "strict_pass":
+                strict_pass,
+        },
+
+        checkpoint_rows,
+
+        event_rows,
+    )
+
+
+# ==================================================================================================
+# 12. RUN ALL 12
+# ==================================================================================================
+
+results_L = []
+checkpoints_L = []
+events_L = []
+
+test_start_L = time.perf_counter()
+
+original_nu1_L = float(
+    NU1_D
+)
+
+original_nu2_L = float(
+    NU2_D
+)
+
+original_tau0_L = float(
+    TAU0_D
+)
+
+case_number_L = 0
+
+try:
+
+    for topology_L in TOPOLOGIES_K:
+
+        for nu_mult_L in NU_MULTS_K:
+
+            case_number_L += 1
+
+            print()
+            print("#" * 136)
+            print(
+                f"CASE {case_number_L:02d}/12"
+                f" | {topology_L:16s}"
+                f" | nu x {nu_mult_L:.2f}"
+            )
+            print("#" * 136)
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            (
+                result_L,
+                checkpoints_case_L,
+                events_case_L,
+            ) = run_case3_L(
+                topology_L,
+                nu_mult_L,
+                case_number_L,
+            )
+
+            results_L.append(
+                result_L
+            )
+
+            checkpoints_L.extend(
+                checkpoints_case_L
+            )
+
+            events_L.extend(
+                events_case_L
+            )
+
+            print()
+            print(
+                "FINAL"
+                f" | state={100*result_L['state_error_m3d3']:.5f}%"
+                f" | RHS={100*result_L['rhs_error_m3d3']:.5f}%"
+                f" | reanchors={result_L['reanchors']}"
+                f" | worst C3 ratio={result_L['worst_cubic_ratio']:.3e}"
+                f" | PASS={result_L['strict_pass']}"
+            )
+
+finally:
+
+    NU1_D = original_nu1_L
+    NU2_D = original_nu2_L
+    TAU0_D = original_tau0_L
+
+
+torch.cuda.synchronize()
+
+total_runtime_L = (
+    time.perf_counter()
+    -
+    test_start_L
+)
+
+
+RESULTS_L = pd.DataFrame(
+    results_L
+)
+
+CHECKPOINTS_L = pd.DataFrame(
+    checkpoints_L
+)
+
+REANCHORS_L = pd.DataFrame(
+    events_L
+)
+
+
+# ==================================================================================================
+# 13. PAIR WITH FROZEN K1 M3D-2 RESULTS
+# ==================================================================================================
+
+baseline_cols_L = (
+    K1_BASELINE_L[
+        [
+            "case",
+            "topology",
+            "nu_mult",
+            "adaptive_state_error",
+            "adaptive_rhs_error",
+        ]
+    ]
+    .rename(
+        columns={
+            "adaptive_state_error":
+                "state_error_m3d2",
+
+            "adaptive_rhs_error":
+                "rhs_error_m3d2",
+        }
+    )
+)
+
+
+PAIRED_L = RESULTS_L.merge(
+    baseline_cols_L,
+    on=[
+        "case",
+        "topology",
+        "nu_mult",
+    ],
+    how="left",
+)
+
+
+PAIRED_L[
+    "state_improvement_2_to_3"
+] = (
+    PAIRED_L[
+        "state_error_m3d2"
+    ]
+    /
+    PAIRED_L[
+        "state_error_m3d3"
+    ]
+)
+
+
+PAIRED_L[
+    "rhs_improvement_2_to_3"
+] = (
+    PAIRED_L[
+        "rhs_error_m3d2"
+    ]
+    /
+    PAIRED_L[
+        "rhs_error_m3d3"
+    ]
+)
+
+
+# ==================================================================================================
+# 14. FINAL TABLE
+# ==================================================================================================
+
+print()
+print("=" * 136)
+print("M3D-2 vs M3D-3* — FINAL PAIRED RESULTS")
+print("=" * 136)
+print()
+
+display_cols_L = [
+    "case",
+    "topology",
+    "nu_mult",
+    "state_error_m3d2",
+    "state_error_m3d3",
+    "state_improvement_2_to_3",
+    "rhs_error_m3d2",
+    "rhs_error_m3d3",
+    "rhs_improvement_2_to_3",
+    "worst_cubic_ratio",
+    "strict_pass",
+]
+
+print(
+    PAIRED_L[
+        display_cols_L
+    ].to_string(
+        index=False,
+        float_format=lambda x:
+            f"{x:.8g}",
+    )
+)
+
+
+# ==================================================================================================
+# 15. SUMMARIES
+# ==================================================================================================
+
+strict_passes_L = int(
+    PAIRED_L[
+        "strict_pass"
+    ].sum()
+)
+
+median_state2_L = float(
+    PAIRED_L[
+        "state_error_m3d2"
+    ].median()
+)
+
+median_state3_L = float(
+    PAIRED_L[
+        "state_error_m3d3"
+    ].median()
+)
+
+worst_state3_L = float(
+    PAIRED_L[
+        "state_error_m3d3"
+    ].max()
+)
+
+median_rhs2_L = float(
+    PAIRED_L[
+        "rhs_error_m3d2"
+    ].median()
+)
+
+median_rhs3_L = float(
+    PAIRED_L[
+        "rhs_error_m3d3"
+    ].median()
+)
+
+worst_rhs3_L = float(
+    PAIRED_L[
+        "rhs_error_m3d3"
+    ].max()
+)
+
+median_state_improvement_L = float(
+    PAIRED_L[
+        "state_improvement_2_to_3"
+    ].median()
+)
+
+median_rhs_improvement_L = float(
+    PAIRED_L[
+        "rhs_improvement_2_to_3"
+    ].median()
+)
+
+all_cubic_ok_L = bool(
+    PREFLIGHT_L[
+        "cubic_cancel_ok"
+    ].all()
+    and
+    (
+        PAIRED_L[
+            "worst_r3_ratio"
+        ]
+        <
+        R3_RATIO_GATE_L
+    ).all()
+)
+
+primary_gate_L = bool(
+    all_cubic_ok_L
+    and
+    strict_passes_L
+    ==
+    12
+)
+
+
+# ==================================================================================================
+# 16. TOPOLOGY + VISCOSITY SUMMARY
+# ==================================================================================================
+
+TOPOLOGY_L = (
+    PAIRED_L
+    .groupby(
+        "topology"
+    )
+    .agg(
+        m3d2_state_median=(
+            "state_error_m3d2",
+            "median",
+        ),
+
+        m3d3_state_median=(
+            "state_error_m3d3",
+            "median",
+        ),
+
+        state_improvement=(
+            "state_improvement_2_to_3",
+            "median",
+        ),
+
+        m3d3_rhs_median=(
+            "rhs_error_m3d3",
+            "median",
+        ),
+
+        strict_passes=(
+            "strict_pass",
+            "sum",
+        ),
+    )
+    .reset_index()
+)
+
+
+VISCOSITY_L = (
+    PAIRED_L
+    .groupby(
+        "nu_mult"
+    )
+    .agg(
+        m3d2_state_median=(
+            "state_error_m3d2",
+            "median",
+        ),
+
+        m3d3_state_median=(
+            "state_error_m3d3",
+            "median",
+        ),
+
+        state_improvement=(
+            "state_improvement_2_to_3",
+            "median",
+        ),
+
+        m3d3_rhs_median=(
+            "rhs_error_m3d3",
+            "median",
+        ),
+
+        strict_passes=(
+            "strict_pass",
+            "sum",
+        ),
+    )
+    .reset_index()
+)
+
+
+print()
+print("=" * 136)
+print("TOPOLOGY SUMMARY")
+print("=" * 136)
+print()
+
+print(
+    TOPOLOGY_L.to_string(
+        index=False,
+        float_format=lambda x:
+            f"{x:.8g}",
+    )
+)
+
+
+print()
+print("=" * 136)
+print("VISCOSITY SUMMARY")
+print("=" * 136)
+print()
+
+print(
+    VISCOSITY_L.to_string(
+        index=False,
+        float_format=lambda x:
+            f"{x:.8g}",
+    )
+)
+
+
+# ==================================================================================================
+# 17. FINAL DIAGNOSIS
+# ==================================================================================================
+
+print()
+print("=" * 136)
+print("M3D TEST L — FINAL DIAGNOSIS")
+print("=" * 136)
+print()
+
+print(
+    "cubic implementation gate:",
+    all_cubic_ok_L
+)
+
+print()
+
+print(
+    "strict M3D-3* passes:",
+    strict_passes_L,
+    "/ 12",
+)
+
+print()
+
+print(
+    "M3D-2 median state error:",
+    f"{100*median_state2_L:.6f}%"
+)
+
+print(
+    "M3D-3* median state error:",
+    f"{100*median_state3_L:.6f}%"
+)
+
+print(
+    "median state improvement:",
+    f"{median_state_improvement_L:.3f}x"
+)
+
+print()
+
+print(
+    "M3D-2 median RHS error:",
+    f"{100*median_rhs2_L:.6f}%"
+)
+
+print(
+    "M3D-3* median RHS error:",
+    f"{100*median_rhs3_L:.6f}%"
+)
+
+print(
+    "median RHS improvement:",
+    f"{median_rhs_improvement_L:.3f}x"
+)
+
+print()
+
+print(
+    "worst M3D-3* state error:",
+    f"{100*worst_state3_L:.6f}%"
+)
+
+print(
+    "worst M3D-3* RHS error:",
+    f"{100*worst_rhs3_L:.6f}%"
+)
+
+print()
+
+print(
+    "total M3D-3* validation runtime:",
+    f"{total_runtime_L:.2f}s"
+)
+
+print()
+
+print(
+    "PRIMARY ALL-12 GATE:",
+    primary_gate_L
+)
+
+print()
+
+
+if primary_gate_L:
+
+    print(
+        "🔥🔥🔥 PRIMARY PASS"
+    )
+
+    print(
+        "Cubic-defect cancellation converted the frozen"
+    )
+
+    print(
+        "adaptive rank-2 failure into a 12/12 adaptive"
+    )
+
+    print(
+        "rank-3* pass at tau≈2."
+    )
+
+elif (
+    median_state3_L
+    <
+    median_state2_L
+    and
+    median_state_improvement_L
+    >
+    1.5
+):
+
+    print(
+        "✅ MATERIAL IMPROVEMENT, BUT NOT A FULL GENERALIZATION PASS."
+    )
+
+    print(
+        "q2* reduced the global error substantially,"
+    )
+
+    print(
+        "but cubic cancellation alone does not completely"
+    )
+
+    print(
+        "solve the tau=2 generalization problem."
+    )
+
+else:
+
+    print(
+        "❌ CUBIC CANCELLATION DID NOT MATERIALIZE INTO"
+    )
+
+    print(
+        "A LARGE GLOBAL ACCURACY IMPROVEMENT."
+    )
+
+    print(
+        "That would mean the dominant long-horizon error"
+    )
+
+    print(
+        "is higher-order / propagated error rather than C3."
+    )
+
+
+# ==================================================================================================
+# 18. SAVE
+# ==================================================================================================
+
+PREFLIGHT_L.to_csv(
+    "/content/m3d_test_L_cubic_preflight.csv",
+    index=False,
+)
+
+PAIRED_L.to_csv(
+    "/content/m3d_test_L_paired_final.csv",
+    index=False,
+)
+
+CHECKPOINTS_L.to_csv(
+    "/content/m3d_test_L_checkpoints.csv",
+    index=False,
+)
+
+REANCHORS_L.to_csv(
+    "/content/m3d_test_L_reanchors.csv",
+    index=False,
+)
+
+TOPOLOGY_L.to_csv(
+    "/content/m3d_test_L_topology_summary.csv",
+    index=False,
+)
+
+VISCOSITY_L.to_csv(
+    "/content/m3d_test_L_viscosity_summary.csv",
+    index=False,
+)
+
+print()
+print("Saved:")
+print("/content/m3d_test_L_cubic_preflight.csv")
+print("/content/m3d_test_L_paired_final.csv")
+print("/content/m3d_test_L_checkpoints.csv")
+print("/content/m3d_test_L_reanchors.csv")
+print("/content/m3d_test_L_topology_summary.csv")
+print("/content/m3d_test_L_viscosity_summary.csv")
+
+# ---- OUTPUT --------------------------------------------------------------
+# ========================================================================================================================================
+# M3D TEST L — CUBIC-DEFECT-CANCELING M3D-3*
+# ========================================================================================================================================
+# 
+
+# ==========================================================================
+# CELL 1
+# ==========================================================================
+%run /content/m3d_baseline_rebuilt.py
+# ==========================================================================
+# CELL 2
+# ==========================================================================
+from google.colab import files
+files.upload()
+
+# ---- OUTPUT --------------------------------------------------------------
+# <IPython.core.display.HTML object>Saving m3d_baseline_rebuilt(1).py to m3d_baseline_rebuilt(1) (1).py
+# {'m3d_baseline_rebuilt(1) (1).py': b'"""\nM3D-2 reconstructed baseline for Colab / PyTorch\n=================================================\n\nThis 
+
+# ==========================================================================
+# CELL 3
+# ==========================================================================
+%run /content/m3d_baseline_rebuilt(1).py
+
+# ---- OUTPUT --------------------------------------------------------------
+# M3D-2 reconstructed baseline loaded.
+# Device: cuda
+# Available environments: {'small': (40, 8.0, 0.2), 'large': (80, 16.0, 0.2)}
+# Run: m3d_baseline_selftest_D()
+# 
+
+# ==========================================================================
+# CELL 4
+# ==========================================================================
+required = [
+    "initial_flow_D",
+    "initialize_model_D",
+    "m3d_rhs_D",
+    "m3d_rk4_D",
+    "velocity_rhs_D",
+    "full_rk4_D",
+    "TAU0_D",
+    "NU1_D",
+    "NU2_D",
+    "small_env_D",
+]
+
+missing = [x for x in required if x not in globals()]
+
+print("missing:", missing)
+
+assert not missing, missing
+assert DEVICE_D.type == "cuda"
+
+print("✅ M3D baseline restored on GPU")
+
+# ---- OUTPUT --------------------------------------------------------------
+# missing: []
+# ✅ M3D baseline restored on GPU
+# 
+
+# ==========================================================================
+# CELL 5
+# ==========================================================================
+[x for x in [
+    "topology_pair_K",
+    "TOPOLOGIES_K",
+    "NU_MULTS_K",
+    "BASE_NU_K",
+    "COMMON_TAU0_K",
+    "DT_PHYS_K",
+    "PROJECTOR_K",
+] if x not in globals()]
+
+# ---- OUTPUT --------------------------------------------------------------
+# ['topology_pair_K',
+#  'TOPOLOGIES_K',
+#  'NU_MULTS_K',
+#  'BASE_NU_K',
+#  'COMMON_TAU0_K',
+#  'DT_PHYS_K',
+#  'PROJECTOR_K']
+
+# ==========================================================================
+# CELL 6
+# ==========================================================================
+# ============================================================
+# RESTORE FROZEN K1 CONSTANTS
+# ============================================================
+
+TOPOLOGIES_K = [
+    "vortex_ring",
+    "periodic_shear",
+    "skew_tubes",
+    "mixed_vortices",
+]
+
+NU_MULTS_K = [0.25, 1.0, 4.0]
+
+BASE_NU_K = 0.0025
+COMMON_TAU0_K = 40.0 / 3.0
+DT_PHYS_K = 0.01
+PROJECTOR_K = "mixed"
+
+required = [
+    "topology_pair_K",
+    "TOPOLOGIES_K",
+    "NU_MULTS_K",
+    "BASE_NU_K",
+    "COMMON_TAU0_K",
+    "DT_PHYS_K",
+    "PROJECTOR_K",
+]
+
+missing = [x for x in required if x not in globals()]
+
+print("Missing:", missing)
+
+assert abs(TAU0_D - COMMON_TAU0_K) < 1e-12
+assert abs(NU1_D - BASE_NU_K) < 1e-12
+
+print("✅ K1 constants restored")
+
+# ---- OUTPUT --------------------------------------------------------------
+# Missing: ['topology_pair_K']
+# ✅ K1 constants restored
+# 
