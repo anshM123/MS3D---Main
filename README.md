@@ -1,4 +1,4 @@
-# MS3D — observable-preserving correction of hidden error in reduced-order models
+# MS3D: observable-preserving correction of hidden error in reduced-order models
 
 Code and recovered experimental record for the MS3D (Mishra–Senthilkumar 3D)
 project.
