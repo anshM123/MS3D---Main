@@ -1,0 +1,136 @@
+{
+  "_README": "CANONICAL STATISTICS. Every number plotted in the manuscript figures and quoted in the text lives here and nowhere else. figs.py reads this file; it hard-codes nothing. Each entry names the script that produced it and the run configuration, so a mismatch between manuscript, README and figures is impossible by construction. Where a raw CSV/JSON artifact exists in the archive its filename is given; where the run predates artifact archiving the console record in notebooks/ is the source.",
+
+  "causal_intervention": {
+    "_source": "navier_stokes/m3d_test_x3_alpha_sweep.py, fp64 + analytic JVP, 12 cases x 3 intervention times",
+    "_artifact": "m3d_X3_fp64_analytic_causal_interventions.csv; console record in notebooks/post_X_archive.txt",
+    "n_windows": 36,
+    "gain_estimated": 1.650998,
+    "gain_wrong_sign": 0.692838,
+    "gain_oracle": 1.650998,
+    "p10_estimated": 1.299859,
+    "reduction_percent": 39.417,
+    "wins_estimated": 36, "wins_wrong_sign": 0, "wins_oracle": 36,
+    "max_start_P_mismatch": 0.0,
+    "oracle_benefit_captured": 1.0
+  },
+
+  "effect_size_law": {
+    "_source": "identity verified per window in each system's runner",
+    "_artifact": "analysis/master.py -> master_kappa.json; per-system runners",
+    "systems": [
+      {"name": "Kuramoto\u2013Sivashinsky", "lam": 0.0891, "cos": -0.4118, "gain": 1.0350, "identity_max_rel_err": 1.97e-15},
+      {"name": "Navier\u2013Stokes",         "lam": 0.4445, "cos": -0.9412, "gain": 1.6510, "identity_max_rel_err": 2.31e-14},
+      {"name": "Ginzburg\u2013Landau",       "lam": 0.9909, "cos": -0.9998, "gain": null,   "identity_max_rel_err": 5.38e-12},
+      {"name": "FD + point sensors",       "lam": 0.3909, "cos": -0.9937, "gain": 1.8811, "identity_max_rel_err": 1.12e-15}
+    ],
+    "ks_damped": {"lam": 1.0298, "cos": -0.9996, "gain": 18.63},
+    "registered_threshold": 1e-9,
+    "worst_case_over_all_systems": 5.38e-12
+  },
+
+  "reachability": {
+    "_source": "navier_stokes/m3d_test_F_reachability.py, N_TEST=20, TAUS=[0.60,0.90,1.20], VARIANTS=A..E",
+    "_note": "20 trajectories x 3 intervention times x 5 variants = 300 windows; the truth-free and oracle corrections are each constrained in every window, giving 600 comparisons.",
+    "n_windows": 300, "n_comparisons": 600, "violations": 0, "windows_per_variant": 60,
+    "variants": [
+      {"id": "A", "subspace": "POD only (frozen)",        "rho": 0.766, "ceiling": 1.555, "gain": 1.0544},
+      {"id": "B", "subspace": "POD + all of P",           "rho": 1.0,   "ceiling": null,  "gain": 1.5834},
+      {"id": "C", "subspace": "POD + P + q0",             "rho": 1.0,   "ceiling": null,  "gain": 1.5978},
+      {"id": "D", "subspace": "POD + P + q0 + q1*",       "rho": 1.0,   "ceiling": null,  "gain": 1.5849},
+      {"id": "E", "subspace": "P + q0 + q1* (STAR2)",     "rho": 1.0,   "ceiling": null,  "gain": 1.5639}
+    ]
+  },
+
+  "validity_boundary": {
+    "_source": "analysis/mix.py, MX_NDIM=24, MX_NTRAJ=10, n=160",
+    "_artifact": "mix.json",
+    "n_windows": 160, "total_observable_dim": 24,
+    "n_sensors":            [0, 1, 2, 3, 6, 12, 18, 24],
+    "reconstruction_error": [0.0049, 0.2231, 0.3066, 0.3777, 0.5133, 0.5352, 0.4160, 0.4509],
+    "lambda":               [0.9201, 0.6537, 0.6126, 0.4783, 0.3747, 0.3329, 0.4057, 0.3560],
+    "_isolation_source": "analysis/isolate.py, one spectral solver, matched dimension",
+    "modes_vs_sensors": {"modes": 0.0028, "sensors": 0.5552, "mixed_50_50": 0.4884, "separation_factor": 200},
+    "_mechanism_source": "analysis/amp.py, AM_NTRAJ=10, n=280",
+    "direction_cosine_small_amplitude": {"modes": 0.9653, "sensors": 0.6845}
+  },
+
+  "adaptive": {
+    "_source": "algorithm/adapt.py, AD_NTRAJ=30, n=60 windows per band",
+    "_artifact": "adapt_unstable.json, adapt_damped.json",
+    "n_per_band": 60,
+    "methods":  ["uncorrected", "hidden-only", "observable-only", "ensemble 3DVar", "adaptive"],
+    "unstable": [1.00, 1.05, 3.11, 3.03, 14.09],
+    "damped":   [1.00, 16.34, 1.00, 1.28, 16.65],
+    "lam_unstable": 0.09, "lam_damped": 1.04,
+    "_alpha_fixed_control": "with alpha fixed at 1, adaptive gives 3.28 (unstable) and 16.65 (damped)",
+    "picks_unstable": {"observable_touching": 51, "other": 9},
+    "picks_damped":   {"hidden_only": 51, "other": 9},
+    "_3dvar_note": "background covariance built from the model's own error-snapshot ensemble AND the true observable at analysis time; deliberately advantaged"
+  },
+
+  "cost": {
+    "_source": "navier_stokes/bench_cost.py, measured wall clock, Tesla T4",
+    "N":                [40, 64, 80],
+    "measured_ratio":   [3.0613, 0.7110, 0.3443],
+    "gridpoint_model":  [1.029, 0.2512, 0.1286],
+    "coarse_grid_M": 28,
+    "_note": "ratio of estimator wall time to one full-solver segment; the estimator is latency-bound, so the correct model is a fixed floor rather than a ratio"
+  },
+
+  "closed_loop": {
+    "_source": "navier_stokes/m3d_test_LOOP3D.py, M3D_LP_N=40 M3D_LP_M=28 M3D_LP_SEG=6",
+    "_note": "uses the COARSE defect at M=28, not the full flow map",
+    "n_cases": 12, "segments": 6,
+    "error_uncorrected_percent": 6.276, "error_closed_loop_percent": 0.129,
+    "improvement": 48.5,
+    "cost_vs_full_solver": 11.06,
+    "estimator_residual_floor": 1.1e-4,
+    "median_final_error_over_floor": 14,
+    "divergences": 0
+  },
+
+  "genericity": {
+    "pod_frozen_basis": {
+      "_source": "navier_stokes/m3d_test_P1_genericity.py",
+      "n_trajectories": 20, "n_windows": 60,
+      "median_gain": 1.0439, "ci95": [1.0192, 1.0878],
+      "wins_trajectories": 20, "wrong_sign_losses": 20,
+      "oracle_captured": 1.0004,
+      "baseline_error_band_percent": [1.8, 11.3]
+    },
+    "containment_attribution": {"containment": 1.011, "local_jet": 0.001, "global_pod": -0.012},
+    "probe_3d": {
+      "_source": "navier_stokes/probe3d.py, PB_NTRAJ=12",
+      "n_windows": 36, "n_probes": 8, "n_directions": 24,
+      "max_relative_probe_change": 3.119e-11,
+      "median_gain": 1.7140, "reduction_percent": 46.8,
+      "baseline_error_percent": 0.56,
+      "_caveat": "baseline error is an order of magnitude below the POD genericity band; demonstrates the observation operator at 3D scale on an already-accurate model"
+    },
+    "cgl_prospective": {
+      "_source": "ginzburg_landau/cgl2.py, CGL2_NTRAJ=20, n=120",
+      "n_windows": 120,
+      "predictions_registered_before_run": 4, "predictions_passed": 4,
+      "identity_max_rel_err": 3.763e-12,
+      "causal_signature": "120/120",
+      "applicability_spearman": 0.9997
+    }
+  },
+
+  "truth_free_prediction": {
+    "_source": "algorithm/apply.py and per-system runners",
+    "spearman_Ghat_vs_realised": {
+      "KS_unstable": 1.0000, "KS_damped": 0.9977,
+      "CGL": 0.9997, "FD_sensors": 1.0000, "NS_3D": 1.0000
+    },
+    "amplitude_selection": {
+      "_source": "algorithm/alg.py, ALG_NTRAJ=40, n=80 per band",
+      "probe_captured_fraction": 1.000,
+      "two_point_fit_captured": 0.605,
+      "small_amplitude_fit_captured": 0.000,
+      "harm_avoidance": {"fixed_alpha_win_rate": 0.958, "adaptive_win_rate": 1.000,
+                         "fixed_alpha_worst": 0.9712, "adaptive_worst": 1.0000}
+    }
+  }
+}
